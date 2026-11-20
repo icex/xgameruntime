@@ -41,6 +41,11 @@ WINE_DEFAULT_DEBUG_CHANNEL(xpackage);
 #define ARRAY_SIZE(a) (sizeof(a) / sizeof((a)[0]))
 #endif
 
+/* Older GDKs use the same initial vtable under a different IID. Their
+ * package operations occupy the reserved slots in IXPackageImpl. */
+static const GUID legacy_package_iid = {0xbe3f3e9f, 0xc4b3, 0x424d,
+                                       {0x9a, 0x95, 0xd1, 0xaf, 0x06, 0x05, 0x59, 0xa5}};
+
 /* A mount handle just carries the filesystem path it resolves to. */
 struct x_package_mount
 {
@@ -218,6 +223,7 @@ static HRESULT WINAPI x_package_QueryInterface( IXPackageImpl3 *iface, REFIID ii
     TRACE( "iface %p, iid %s, out %p.\n", iface, debugstr_guid( iid ), out );
 
     if (IsEqualGUID( iid, &IID_IUnknown       ) ||
+        IsEqualGUID( iid, &legacy_package_iid ) ||
         IsEqualGUID( iid, &IID_IXPackageImpl  ) ||
         IsEqualGUID( iid, &IID_IXPackageImpl2 ) ||
         IsEqualGUID( iid, &IID_IXPackageImpl3 ))
@@ -449,15 +455,13 @@ static HRESULT WINAPI x_package_XPackageUninstallChunks( IXPackageImpl3 *iface, 
     return S_OK;
 }
 
-static HRESULT WINAPI __PADDING__( IXPackageImpl3 *iface )
+static HRESULT WINAPI x_package_XPackageRegisterPackageInstalledLegacy( IXPackageImpl3 *iface,
+    XTaskQueueHandle queue, void *context, XPackageInstalledCallback *callback, XTaskQueueRegistrationToken *token )
 {
-    WARN( "iface %p padding function called!\n", iface );
-    return E_NOTIMPL;
-}
-
-static HRESULT WINAPI __PADDING_2__( IXPackageImpl3 *iface )
-{
-    WARN( "iface %p padding function called!\n", iface );
+    TRACE( "iface %p, queue %p, context %p, callback %p, token %p.\n", iface, queue, context, callback, token );
+    if (!token) return E_INVALIDARG;
+    token->token = 0;
+    if (!callback) return E_INVALIDARG;
     return E_NOTIMPL;
 }
 
@@ -467,9 +471,14 @@ static BOOLEAN WINAPI x_package_XPackageUnregisterPackageInstalled( IXPackageImp
     return TRUE;
 }
 
-static HRESULT WINAPI __PADDING_3__( IXPackageImpl3 *iface )
+static HRESULT WINAPI x_package_XPackageMountLegacy( IXPackageImpl3 *iface, const char *identifier,
+                                                     XPackageMountHandle *mount )
 {
-    WARN( "iface %p padding function called!\n", iface );
+    TRACE( "iface %p, identifier %s, mount %p.\n", iface, debugstr_a( identifier ), mount );
+    if (!mount) return E_INVALIDARG;
+    *mount = NULL;
+    if (!identifier || !*identifier) return E_INVALIDARG;
+    /* This API requires the licensed content mount, beyond package discovery. */
     return E_NOTIMPL;
 }
 
@@ -511,10 +520,30 @@ static void WINAPI x_package_XPackageCloseMountHandle( IXPackageImpl3 *iface, XP
     free( m );
 }
 
-static HRESULT WINAPI __PADDING_4__( IXPackageImpl3 *iface )
+static HRESULT WINAPI x_package_XPackageGetIdentifierLegacy( IXPackageImpl3 *iface, const char *store,
+                                                              SIZE_T size, char *identifier )
 {
-    WARN( "iface %p padding function called!\n", iface );
-    return E_NOTIMPL;
+    const struct xgr_related_package *packages;
+    char current_store[64];
+    unsigned int count, i;
+
+    TRACE( "iface %p, store %s, size %Iu, identifier %p.\n", iface, debugstr_a( store ), size, identifier );
+    if (!identifier || !size) return E_INVALIDARG;
+    *identifier = 0;
+    if (!store || !*store) return E_INVALIDARG;
+    if (size < sizeof(current_identifier)) return HRESULT_FROM_WIN32( ERROR_INSUFFICIENT_BUFFER );
+
+    if (xgr_config_element( "StoreId", current_store, sizeof(current_store) ) && !stricmp( store, current_store ))
+        return x_package_XPackageGetCurrentProcessPackageIdentifier( iface, size, identifier );
+
+    count = xgr_related_packages( &packages );
+    for (i = 0; i < count; ++i)
+    {
+        if (stricmp( store, packages[i].store )) continue;
+        strcpy( identifier, packages[i].identifier );
+        return S_OK;
+    }
+    return E_INVALIDARG;
 }
 
 /* ---- enumeration -------------------------------------------------------- */
@@ -755,12 +784,6 @@ static HRESULT WINAPI x_package_XPackageGetWriteStats( IXPackageImpl3 *iface, XP
     return S_OK;
 }
 
-static HRESULT WINAPI __PADDING_5__( IXPackageImpl3 *iface )
-{
-    WARN( "iface %p padding function called!\n", iface );
-    return E_NOTIMPL;
-}
-
 static HRESULT WINAPI x_package_XPackageUninstallUWPInstance( IXPackageImpl3 *iface, const char *packageName )
 {
     TRACE( "iface %p, packageName %s.\n", iface, debugstr_a( packageName ) );
@@ -871,18 +894,18 @@ static const struct IXPackageImpl3Vtbl x_package_vtbl =
     x_package_XPackageInstallChunksResult,
     x_package_XPackageEstimateDownloadSize,
     x_package_XPackageUninstallChunks,
-    __PADDING__,
-    __PADDING_2__,
+    x_package_XPackageEnumeratePackages,
+    x_package_XPackageRegisterPackageInstalledLegacy,
     x_package_XPackageUnregisterPackageInstalled,
-    __PADDING_3__,
+    x_package_XPackageMountLegacy,
     x_package_XPackageGetMountPathSize,
     x_package_XPackageGetMountPath,
     x_package_XPackageCloseMountHandle,
-    __PADDING_4__,
+    x_package_XPackageGetIdentifierLegacy,
     x_package_XPackageEnumeratePackages,
     x_package_XPackageRegisterPackageInstalled,
     x_package_XPackageGetWriteStats,
-    __PADDING_5__,
+    x_package_XPackageEnumerateFeatures,
     x_package_XPackageUninstallUWPInstance,
     x_package_XPackageEnumerateFeatures,
     x_package_XPackageUninstallPackage,
