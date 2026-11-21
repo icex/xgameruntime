@@ -34,6 +34,7 @@
 
 #include "private.h"
 #include <bcrypt.h>
+#include "wine/list.h"
 
 WINE_DEFAULT_DEBUG_CHANNEL(xpackage);
 
@@ -52,12 +53,31 @@ struct x_package_mount
     char *path;
 };
 
-/* An installation monitor over an already-installed package: nothing to track,
- * but it must be a distinct non-NULL handle the title can query and close. */
 struct x_package_monitor
 {
-    LONG dummy;
+    struct list entry;
+    XTaskQueueHandle queue;
+    UINT32 interval;
+    unsigned int refs, running;
+    BOOL closed, complete;
 };
+
+struct x_package_progress_registration
+{
+    struct list entry;
+    struct x_package_monitor *monitor;
+    XPackageInstallationProgressCallback *callback;
+    void *context;
+    UINT64 token;
+    DWORD thread;
+    BOOL removed;
+};
+
+static SRWLOCK installation_lock = SRWLOCK_INIT;
+static CONDITION_VARIABLE installation_idle = CONDITION_VARIABLE_INIT;
+static struct list installation_monitors = LIST_INIT(installation_monitors);
+static struct list installation_registrations = LIST_INIT(installation_registrations);
+static UINT64 installation_next_token;
 
 struct x_package
 {
@@ -326,60 +346,278 @@ static HRESULT WINAPI x_package_XPackageGetUserLocale( IXPackageImpl3 *iface, SI
     return S_OK;
 }
 
-/* ---- installation state (everything is already installed) --------------- */
+/* ---- installation state ------------------------------------------------- */
+
+static DWORD install_file_attributes( const WCHAR *root, const WCHAR *name )
+{
+    WCHAR path[MAX_PATH + 48];
+
+    if (swprintf( path, ARRAY_SIZE(path), L"%ls\\%ls", root, name ) < 0)
+    {
+        SetLastError( ERROR_FILENAME_EXCED_RANGE );
+        return INVALID_FILE_ATTRIBUTES;
+    }
+    return GetFileAttributesW( path );
+}
+
+static BOOL install_file_absent( const WCHAR *root, const WCHAR *name )
+{
+    DWORD error;
+
+    if (install_file_attributes( root, name ) != INVALID_FILE_ATTRIBUTES) return FALSE;
+    error = GetLastError();
+    return error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND;
+}
+
+static BOOL current_installation_complete( const char *identifier )
+{
+    const char *current = xgr_current_package_identifier();
+    WCHAR *root;
+    DWORD attributes;
+    BOOL result;
+
+    if (!identifier || !current || strcmp( identifier, current ) || !(root = xgr_package_root())) return FALSE;
+    /* This metadata is committed only after the streaming installer has
+     * finished. An interrupted update can leave the old container in place. */
+    attributes = install_file_attributes( root, L".xodus-streaming.msixvc" );
+    result = attributes != INVALID_FILE_ATTRIBUTES && !(attributes & FILE_ATTRIBUTE_DIRECTORY) &&
+             install_file_absent( root, L".xodus-streaming-tmp.msixvc" ) &&
+             install_file_absent( root, L".ferestre-update-incomplete-v1" );
+    free( root );
+    return result;
+}
+
+/* Callers hold installation_lock for list lookup and reference changes. */
+static struct x_package_monitor *find_installation_monitor( XPackageInstallationMonitorHandle handle )
+{
+    struct x_package_monitor *monitor;
+
+    LIST_FOR_EACH_ENTRY( monitor, &installation_monitors, struct x_package_monitor, entry )
+        if (handle == (XPackageInstallationMonitorHandle)monitor) return monitor;
+    return NULL;
+}
+
+static void release_installation_monitor( struct x_package_monitor *monitor )
+{
+    AcquireSRWLockExclusive( &installation_lock );
+    if (--monitor->refs)
+    {
+        ReleaseSRWLockExclusive( &installation_lock );
+        return;
+    }
+    list_remove( &monitor->entry );
+    ReleaseSRWLockExclusive( &installation_lock );
+    if (monitor->queue) IXThreadingImpl_XTaskQueueCloseHandle( x_threading_impl, monitor->queue );
+    free( monitor );
+}
+
+static struct x_package_progress_registration *find_progress_registration( UINT64 token )
+{
+    struct x_package_progress_registration *reg;
+
+    LIST_FOR_EACH_ENTRY( reg, &installation_registrations, struct x_package_progress_registration, entry )
+        if (reg->token == token) return reg;
+    return NULL;
+}
+
+static void remove_progress_registration( struct x_package_progress_registration *reg )
+{
+    list_remove( &reg->entry );
+    free( reg );
+}
+
+static BOOLEAN unregister_progress( XPackageInstallationMonitorHandle handle, UINT64 token, BOOLEAN wait )
+{
+    struct x_package_progress_registration *reg;
+    BOOLEAN complete = TRUE;
+
+    AcquireSRWLockExclusive( &installation_lock );
+    while ((reg = find_progress_registration( token )) && (XPackageInstallationMonitorHandle)reg->monitor == handle)
+    {
+        reg->removed = TRUE;
+        if (!reg->thread)
+        {
+            remove_progress_registration( reg );
+            break;
+        }
+        /* A callback may unregister itself. It retires the token on return. */
+        if (!wait || reg->thread == GetCurrentThreadId())
+        {
+            complete = FALSE;
+            break;
+        }
+        SleepConditionVariableSRW( &installation_idle, &installation_lock, INFINITE, 0 );
+    }
+    ReleaseSRWLockExclusive( &installation_lock );
+    return complete;
+}
+
+static void CALLBACK deliver_installation_progress( void *context, BOOLEAN cancelled )
+{
+    struct x_package_progress_registration *reg;
+    struct x_package_monitor *monitor;
+
+    if (cancelled) return;
+    AcquireSRWLockExclusive( &installation_lock );
+    reg = find_progress_registration( (UINT_PTR)context );
+    if (!reg || reg->removed)
+    {
+        ReleaseSRWLockExclusive( &installation_lock );
+        return;
+    }
+    monitor = reg->monitor;
+    ++monitor->refs;
+    ++monitor->running;
+    reg->thread = GetCurrentThreadId();
+    ReleaseSRWLockExclusive( &installation_lock );
+
+    reg->callback( reg->context, (XPackageInstallationMonitorHandle)monitor );
+
+    AcquireSRWLockExclusive( &installation_lock );
+    reg->thread = 0;
+    --monitor->running;
+    if (reg->removed) remove_progress_registration( reg );
+    WakeAllConditionVariable( &installation_idle );
+    ReleaseSRWLockExclusive( &installation_lock );
+    release_installation_monitor( monitor );
+}
 
 static HRESULT WINAPI x_package_XPackageCreateInstallationMonitor( IXPackageImpl3 *iface, const char *packageIdentifier, UINT32 selectorCount, XPackageChunkSelector *selectors, UINT32 minimumUpdateIntervalMs, XTaskQueueHandle queue, XPackageInstallationMonitorHandle *installationMonitor )
 {
     struct x_package_monitor *monitor;
+    HRESULT hr;
 
     TRACE( "iface %p, packageIdentifier %s, selectorCount %u, minimumUpdateIntervalMs %u, installationMonitor %p.\n",
            iface, debugstr_a( packageIdentifier ), selectorCount, minimumUpdateIntervalMs, installationMonitor );
 
     if (!installationMonitor) return E_INVALIDARG;
+    *installationMonitor = NULL;
+    if (selectorCount && !selectors) return E_INVALIDARG;
     if (!(monitor = calloc( 1, sizeof(*monitor) ))) return E_OUTOFMEMORY;
+    if (queue && FAILED(hr = IXThreadingImpl_XTaskQueueDuplicateHandle( x_threading_impl, queue, &monitor->queue )))
+    {
+        free( monitor );
+        return hr;
+    }
+    /* Ferestre launches complete packages, so every local selection is
+     * ready. This does not authorize installs or expose unrelated packages. */
+    monitor->complete = current_installation_complete( packageIdentifier );
+    monitor->interval = minimumUpdateIntervalMs;
+    monitor->refs = 1;
+    AcquireSRWLockExclusive( &installation_lock );
+    list_add_tail( &installation_monitors, &monitor->entry );
+    ReleaseSRWLockExclusive( &installation_lock );
     *installationMonitor = (XPackageInstallationMonitorHandle)monitor;
     return S_OK;
 }
 
 static void WINAPI x_package_XPackageCloseInstallationMonitorHandle( IXPackageImpl3 *iface, XPackageInstallationMonitorHandle installationMonitor )
 {
+    struct x_package_progress_registration *reg, *next;
+    struct x_package_monitor *monitor;
+    BOOL on_callback = FALSE;
+
     TRACE( "iface %p, installationMonitor %p.\n", iface, installationMonitor );
-    free( installationMonitor );
+
+    AcquireSRWLockExclusive( &installation_lock );
+    if (!(monitor = find_installation_monitor( installationMonitor )) || monitor->closed)
+    {
+        ReleaseSRWLockExclusive( &installation_lock );
+        return;
+    }
+    monitor->closed = TRUE;
+    LIST_FOR_EACH_ENTRY_SAFE( reg, next, &installation_registrations, struct x_package_progress_registration, entry )
+    {
+        if (reg->monitor != monitor) continue;
+        reg->removed = TRUE;
+        if (!reg->thread) remove_progress_registration( reg );
+        else if (reg->thread == GetCurrentThreadId()) on_callback = TRUE;
+    }
+    /* Closing from the notification itself is a supported usage. */
+    while (!on_callback && monitor->running)
+        SleepConditionVariableSRW( &installation_idle, &installation_lock, INFINITE, 0 );
+    ReleaseSRWLockExclusive( &installation_lock );
+    release_installation_monitor( monitor );
 }
 
 static void WINAPI x_package_XPackageGetInstallationProgress( IXPackageImpl3 *iface, XPackageInstallationMonitorHandle installationMonitor, XPackageInstallationProgress *progress )
 {
+    struct x_package_monitor *monitor;
+
     TRACE( "iface %p, installationMonitor %p, progress %p.\n", iface, installationMonitor, progress );
 
     if (!progress) return;
-    /* fully installed: a non-zero, all-installed, launchable, completed state */
-    progress->totalBytes = 1;
-    progress->installedBytes = 1;
-    progress->launchBytes = 0;
-    progress->launchable = TRUE;
-    progress->completed = TRUE;
+    memset( progress, 0, sizeof(*progress) );
+    progress->totalBytes = ~(UINT64)0; /* GDK's sentinel for an unknown total. */
+    AcquireSRWLockShared( &installation_lock );
+    if ((monitor = find_installation_monitor( installationMonitor )) && monitor->complete)
+    {
+        /* Retain the existing normalized complete snapshot. Ferestre has
+         * only whole-package installs, with no separate launch threshold. */
+        progress->totalBytes = progress->installedBytes = progress->launchBytes = 1;
+        progress->launchable = progress->completed = TRUE;
+    }
+    ReleaseSRWLockShared( &installation_lock );
 }
 
 static BOOLEAN WINAPI x_package_XPackageUpdateInstallationMonitor( IXPackageImpl3 *iface, XPackageInstallationMonitorHandle installationMonitor )
 {
     TRACE( "iface %p, installationMonitor %p.\n", iface, installationMonitor );
-    /* nothing changes: install is already complete */
+    /* A running package has no asynchronous installer to refresh. */
     return FALSE;
 }
 
 static HRESULT WINAPI x_package_XPackageRegisterInstallationProgressChanged( IXPackageImpl3 *iface, XPackageInstallationMonitorHandle installationMonitor, void *context, XPackageInstallationProgressCallback *callback, XTaskQueueRegistrationToken *token )
 {
+    struct x_package_progress_registration *reg;
+    struct x_package_monitor *monitor;
+    UINT64 id;
+    BOOL schedule;
+    HRESULT hr;
+
     TRACE( "iface %p, installationMonitor %p, context %p, callback %p, token %p.\n", iface, installationMonitor, context, callback, token );
 
-    /* nothing will ever change, so no callback is scheduled; hand back a token */
-    if (token) token->token = 1;
-    return S_OK;
+    if (!token) return E_INVALIDARG;
+    token->token = 0;
+    if (!callback) return E_INVALIDARG;
+    if (!(reg = calloc( 1, sizeof(*reg) ))) return E_OUTOFMEMORY;
+    AcquireSRWLockExclusive( &installation_lock );
+    monitor = find_installation_monitor( installationMonitor );
+    if (!monitor || monitor->closed || installation_next_token == ~(UINT_PTR)0)
+    {
+        hr = !monitor || monitor->closed ? E_INVALIDARG : E_OUTOFMEMORY;
+        ReleaseSRWLockExclusive( &installation_lock );
+        free( reg );
+        return hr;
+    }
+    id = ++installation_next_token;
+    reg->token = token->token = id;
+    reg->monitor = monitor;
+    reg->context = context;
+    reg->callback = callback;
+    list_add_tail( &installation_registrations, &reg->entry );
+    schedule = monitor->complete && monitor->queue && monitor->interval;
+    if (schedule) ++monitor->refs;
+    ReleaseSRWLockExclusive( &installation_lock );
+    if (!schedule) return S_OK;
+
+    /* The queue carries only the unique token. Unregister and close can
+     * release the caller's context even if a manual queue never dispatches. */
+    hr = IXThreadingImpl_XTaskQueueSubmitDelayedCallback( x_threading_impl, monitor->queue,
+        XTaskQueuePort_Completion, monitor->interval, (void *)(UINT_PTR)id, deliver_installation_progress );
+    if (FAILED(hr))
+    {
+        unregister_progress( installationMonitor, id, FALSE );
+        token->token = 0;
+    }
+    release_installation_monitor( monitor );
+    return hr;
 }
 
 static BOOLEAN WINAPI x_package_XPackageUnregisterInstallationProgressChanged( IXPackageImpl3 *iface, XPackageInstallationMonitorHandle installationMonitor, XTaskQueueRegistrationToken token, BOOLEAN wait )
 {
     TRACE( "iface %p, installationMonitor %p, wait %d.\n", iface, installationMonitor, wait );
-    return TRUE;
+    return unregister_progress( installationMonitor, token.token, wait );
 }
 
 /* ---- chunks (all present) ----------------------------------------------- */
@@ -416,13 +654,15 @@ static HRESULT WINAPI x_package_XPackageInstallChunks( IXPackageImpl3 *iface, co
 
 static HRESULT WINAPI x_package_XPackageInstallChunksAsync( IXPackageImpl3 *iface, const char *packageIdentifier, UINT32 selectorCount, XPackageChunkSelector *selectors, UINT32 minimumUpdateIntervalMs, BOOLEAN suppressUserConfirmation, XAsyncBlock *asyncBlock )
 {
-    struct x_package_monitor *monitor;
+    XPackageInstallationMonitorHandle monitor;
+    HRESULT hr;
 
     TRACE( "iface %p, packageIdentifier %s, selectorCount %u, asyncBlock %p.\n", iface, debugstr_a( packageIdentifier ), selectorCount, asyncBlock );
 
     if (!asyncBlock) return E_INVALIDARG;
-    monitor = calloc( 1, sizeof(*monitor) );
-    xgr_async_complete( asyncBlock, monitor ? S_OK : E_OUTOFMEMORY, monitor );
+    hr = x_package_XPackageCreateInstallationMonitor( iface, packageIdentifier, selectorCount,
+        selectors, minimumUpdateIntervalMs, asyncBlock->queue, &monitor );
+    xgr_async_complete( asyncBlock, hr, monitor );
     return S_OK;
 }
 
