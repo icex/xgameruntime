@@ -977,36 +977,90 @@ static SIZE_T secret_length( const char *value )
     return value ? strnlen( value, 65536 ) : 0;
 }
 
+static const char collections_id_identity;
+
+static void store_id_key_free( struct store_id_key_params *params )
+{
+    if (!params) return;
+    free( (void *)params->service_ticket );
+    free( (void *)params->publisher_user_id );
+    SecureZeroMemory( params->key, sizeof(params->key) );
+    free( params );
+}
+
+static HRESULT CALLBACK collections_id_provider( XAsyncOp op, const XAsyncProviderData *data )
+{
+    struct store_id_key_params *params = data->context;
+    NTSTATUS status;
+    HRESULT hr;
+
+    switch (op)
+    {
+    case XAsyncOp_Begin:
+        return IXThreadingImpl_XAsyncSchedule( x_threading_impl, data->async, 0 );
+    case XAsyncOp_DoWork:
+        status = XGR_UNIX_CALL( store_id_key, params );
+        hr = status == STATUS_IO_TIMEOUT ? HRESULT_FROM_WIN32( ERROR_TIMEOUT ) :
+             status == STATUS_NOT_FOUND ? HRESULT_FROM_WIN32( ERROR_SERVICE_NOT_ACTIVE ) :
+             status ? E_FAIL : S_OK;
+        TRACE( "Collections ID key: status %#lx, hr %#lx, %Iu characters.\n", status, hr,
+               SUCCEEDED(hr) ? strlen( params->key ) : 0 );
+        IXThreadingImpl_XAsyncComplete( x_threading_impl, data->async, hr,
+                                        SUCCEEDED(hr) ? strlen( params->key ) + 1 : 0 );
+        /* Completion may release the context on another thread. */
+        return E_PENDING;
+    case XAsyncOp_GetResult:
+        memcpy( data->buffer, params->key, strlen( params->key ) + 1 );
+        return S_OK;
+    case XAsyncOp_Cleanup:
+        store_id_key_free( params );
+        return S_OK;
+    default:
+        return S_OK;
+    }
+}
+
+/* The title's own service supplies a ticket for the Store; the Store returns
+ * the Collections ID key the title's service then uses to see what the
+ * player owns. xodus-service makes that request for the Store account. */
 static HRESULT WINAPI x_store_XStoreGetUserCollectionsIdAsync( IXStoreImpl6 *iface, const XStoreContextHandle storeContextHandle, const char *serviceTicket, const char *publisherUserId, XAsyncBlock *async )
 {
+    struct store_id_key_params *params;
+    SIZE_T ticket_len, id_len;
+    HRESULT hr;
+
     TRACE( "iface %p, storeContextHandle %p, serviceTicket %s (%Iu chars), publisherUserId %s (%Iu chars), async %p.\n",
            iface, storeContextHandle, serviceTicket ? "present" : "absent", secret_length( serviceTicket ),
            publisherUserId ? "present" : "absent", secret_length( publisherUserId ), async );
-    if (!async) return E_INVALIDARG;
-    xgr_async_complete( async, S_OK, NULL );
-    return S_OK;
+    if (!async || !serviceTicket) return E_INVALIDARG;
+    ticket_len = strnlen( serviceTicket, 16385 );
+    id_len = publisherUserId ? strnlen( publisherUserId, 1025 ) : 0;
+    if (!ticket_len || ticket_len > 16384 || id_len > 1024) return E_INVALIDARG;
+    if (!(params = calloc( 1, sizeof(*params) ))) return E_OUTOFMEMORY;
+    if (!(params->service_ticket = strdup( serviceTicket )) ||
+        !(params->publisher_user_id = strdup( publisherUserId ? publisherUserId : "" )))
+    {
+        store_id_key_free( params );
+        return E_OUTOFMEMORY;
+    }
+    hr = IXThreadingImpl_XAsyncBegin( x_threading_impl, async, params, &collections_id_identity,
+                                     "XStoreGetUserCollectionsId", collections_id_provider );
+    if (FAILED(hr)) store_id_key_free( params );
+    return hr;
 }
 
 static HRESULT WINAPI x_store_XStoreGetUserCollectionsIdResultSize( IXStoreImpl6 *iface, XAsyncBlock *async, SIZE_T *size )
 {
-    HRESULT hr;
-
     TRACE( "iface %p, async %p, size %p.\n", iface, async, size );
-    if (!size) return E_INVALIDARG;
-    if (!xgr_async_completed( async, &hr, NULL )) return E_PENDING;
-    *size = 1;
-    return hr;
+    return IXThreadingImpl_XAsyncGetResultSize( x_threading_impl, async, size );
 }
 
 static HRESULT WINAPI x_store_XStoreGetUserCollectionsIdResult( IXStoreImpl6 *iface, XAsyncBlock *async, SIZE_T size, char *result )
 {
-    HRESULT hr;
-
     TRACE( "iface %p, async %p, size %Iu, result %p.\n", iface, async, size, result );
     if (!result || !size) return E_INVALIDARG;
-    if (!xgr_async_completed( async, &hr, NULL )) return E_PENDING;
-    result[0] = 0;
-    return hr;
+    return IXThreadingImpl_XAsyncGetResult( x_threading_impl, async, &collections_id_identity,
+                                          size, result, NULL );
 }
 
 static HRESULT WINAPI x_store_XStoreGetUserPurchaseIdAsync( IXStoreImpl6 *iface, const XStoreContextHandle storeContextHandle, const char *serviceTicket, const char *publisherUserId, XAsyncBlock *async )

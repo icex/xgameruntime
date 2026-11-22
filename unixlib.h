@@ -83,6 +83,16 @@ struct license_token_params
     char token[XGR_LICENSE_TOKEN_MAX];
 };
 
+/* XStoreGetUserCollectionsId: the title service's ticket and publisher user
+ * ID in, the Store's Collections ID key out (empty on failure). */
+#define XGR_STORE_ID_KEY_MAX 60001
+struct store_id_key_params
+{
+    const char *service_ticket;
+    const char *publisher_user_id;
+    char key[XGR_STORE_ID_KEY_MAX];
+};
+
 #define XGR_CATALOG_MAX (8 * 1024 * 1024)
 struct store_catalog_params
 {
@@ -115,6 +125,7 @@ enum xgr_funcs
     unix_store_catalog,
     unix_account_roles,
     unix_store_entitlement,
+    unix_store_id_key,
     unix_funcs_count,
 };
 

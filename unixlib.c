@@ -565,6 +565,61 @@ done:
     return status;
 }
 
+/* Ferestre Store ID key v1 ("KSDX"): the service owns the Store account's
+ * Microsoft account ticket and posts the title's service ticket to the
+ * Collections keys endpoint. Neither ticket nor key is logged. The reply is
+ * fixed framing with the key as ASCII JWT characters only. */
+static NTSTATUS store_id_key( void *args )
+{
+    struct store_id_key_params *params = args;
+    UINT32 request[5], response[3];
+    long long deadline = license_now_ms() + 50000;
+    NTSTATUS status = STATUS_UNSUCCESSFUL;
+    size_t ticket_len, id_len, i;
+    int fd;
+
+    params->key[0] = 0;
+    if (!params->service_ticket) return STATUS_INVALID_PARAMETER;
+    ticket_len = strnlen( params->service_ticket, 16385 );
+    id_len = params->publisher_user_id ? strnlen( params->publisher_user_id, 1025 ) : 0;
+    if (!ticket_len || ticket_len > 16384 || id_len > 1024) return STATUS_INVALID_PARAMETER;
+    if ((fd = connect_service( deadline )) < 0) return io_status( STATUS_NOT_FOUND );
+    request[0] = 0x5844534b; request[1] = 1; request[2] = 1;
+    request[3] = ticket_len; request[4] = id_len;
+    errno = 0;
+    if (!license_io( fd, request, sizeof(request), TRUE, deadline ) ||
+        !license_io( fd, (void *)params->service_ticket, ticket_len, TRUE, deadline ) ||
+        (id_len && !license_io( fd, (void *)params->publisher_user_id, id_len, TRUE, deadline )) ||
+        !license_io( fd, response, sizeof(response), FALSE, deadline ))
+    { status = io_status( STATUS_UNSUCCESSFUL ); goto done; }
+    if (response[0] != 1)
+    {
+        WARN( "unsupported Store ID key reply (version %u).\n", response[0] );
+        status = STATUS_NOT_SUPPORTED;
+        goto done;
+    }
+    if (response[1] || !response[2] || response[2] >= sizeof(params->key))
+    {
+        WARN( "xodus-service issued no Store ID key (status %u).\n", response[1] );
+        status = response[1] == 2 ? STATUS_NOT_SUPPORTED : STATUS_UNSUCCESSFUL;
+        goto done;
+    }
+    if (!license_io( fd, params->key, response[2], FALSE, deadline ))
+    { status = io_status( STATUS_UNSUCCESSFUL ); goto done; }
+    for (i = 0; i < response[2]; i++)
+        if (!((params->key[i] >= 'a' && params->key[i] <= 'z') ||
+              (params->key[i] >= 'A' && params->key[i] <= 'Z') ||
+              (params->key[i] >= '0' && params->key[i] <= '9') ||
+              params->key[i] == '-' || params->key[i] == '_' || params->key[i] == '.')) goto done;
+    params->key[response[2]] = 0;
+    TRACE( "got a %u-character Store ID key.\n", response[2] );
+    status = STATUS_SUCCESS;
+done:
+    if (status) params->key[0] = 0;
+    close( fd );
+    return status;
+}
+
 const unixlib_entry_t __wine_unix_call_funcs[] =
 {
     xsts_token,
@@ -572,6 +627,7 @@ const unixlib_entry_t __wine_unix_call_funcs[] =
     store_catalog,
     account_roles,
     store_entitlement,
+    store_id_key,
 };
 
 C_ASSERT( ARRAYSIZE(__wine_unix_call_funcs) == unix_funcs_count );
