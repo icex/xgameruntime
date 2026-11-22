@@ -1158,10 +1158,25 @@ static INT64 provider_remaining( struct XGameSaveProvider *p )
 static HRESULT create_provider( XUserHandle user, const char *scid, struct XGameSaveProvider **out )
 {
     struct XGameSaveProvider *p;
+    char declared[64];
+    WCHAR suffix[33];
     WCHAR *root;
     HRESULT hr;
 
-    if (!user || !scid || !out) return E_INVALIDARG;
+    /* No configuration id means the title's own: the SCID its
+     * MicrosoftGame.config names under <SaveGameStorage>, which is where
+     * Windows keeps those saves, or else what an all-zero id resolves to.
+     * Batman: Arkham Knight passes none; refusing it left the title without a
+     * save provider and its first save spinning for good. */
+    if (!scid)
+    {
+        if (xgr_config_element( "SCID", declared, sizeof(declared) ) && scid_to_suffix( declared, suffix ))
+            scid = declared;
+        else
+            scid = "00000000-0000-0000-0000-000000000000";
+        TRACE( "no configuration id; using %s.\n", debugstr_a( scid ) );
+    }
+    if (!user || !out) return E_INVALIDARG;
     if (!(p = calloc( 1, sizeof(*p) ))) return E_OUTOFMEMORY;
     p->ref = 1;
     p->result_handle = p;
