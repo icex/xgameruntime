@@ -631,10 +631,120 @@ static HRESULT WINAPI x_package_XPackageFindChunkAvailability( IXPackageImpl3 *i
     return S_OK;
 }
 
+/* The package's layout_*.xml (the chunk map makepkg wrote next to
+ * MicrosoftGame.config), NUL-terminated, or NULL when the package has none. */
+static char *load_chunk_layout( void )
+{
+    WCHAR *root, pattern[MAX_PATH], file[MAX_PATH];
+    WIN32_FIND_DATAW data;
+    HANDLE find, handle;
+    DWORD size, read;
+    char *xml = NULL;
+
+    if (!(root = xgr_package_root())) return NULL;
+    swprintf( pattern, ARRAY_SIZE(pattern), L"%ls\\layout_*.xml", root );
+    find = FindFirstFileW( pattern, &data );
+    if (find == INVALID_HANDLE_VALUE)
+    {
+        free( root );
+        return NULL;
+    }
+    FindClose( find );
+    swprintf( file, ARRAY_SIZE(file), L"%ls\\%ls", root, data.cFileName );
+    free( root );
+    handle = CreateFileW( file, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING, 0, NULL );
+    if (handle == INVALID_HANDLE_VALUE) return NULL;
+    size = GetFileSize( handle, NULL );
+    if (size && size <= 16 * 1024 * 1024 && (xml = calloc( size + 1, 1 )) &&
+        (!ReadFile( handle, xml, size, &read, NULL ) || read != size))
+    {
+        free( xml );
+        xml = NULL;
+    }
+    CloseHandle( handle );
+    return xml;
+}
+
+/* Report every chunk of the package, Ready ones included, synchronously on the
+ * calling thread, as the GDK does. Titles seed a chunk-id -> availability map
+ * and only learn that content is installed from these callbacks: Death
+ * Stranding keeps chunks 1-3 at Unavailable when none arrive and then finds no
+ * prefetch list for its root asset. Everything here is installed (see
+ * XPackageFindChunkAvailability), so each selector is Ready. */
 static HRESULT WINAPI x_package_XPackageEnumerateChunkAvailability( IXPackageImpl3 *iface, const char *packageIdentifier, XPackageChunkSelectorType type, void *context, XPackageChunkAvailabilityCallback *callback )
 {
+    const XPackageChunkAvailability avail = XPackageChunkAvailability_Ready;
+    XPackageChunkSelector sel;
+    unsigned int count = 0;
+
     TRACE( "iface %p, packageIdentifier %s, type %d, context %p, callback %p.\n", iface, debugstr_a( packageIdentifier ), type, context, callback );
-    /* no pending chunks to report; everything is already Ready */
+
+    if (!packageIdentifier || !callback) return E_INVALIDARG;
+
+    memset( &sel, 0, sizeof(sel) );
+    sel.type = type;
+    switch (type)
+    {
+    case XPackageChunkSelectorType_Chunk:
+    {
+        char *layout = load_chunk_layout();
+        const char *pos = layout;
+        BOOL more = TRUE;
+
+        while (more && pos && (pos = strstr( pos, "<Chunk " )))
+        {
+            const char *end = strchr( pos, '>' ), *id = strstr( pos, " Id=\"" );
+            char *stop;
+            unsigned long value;
+
+            pos += 7;
+            if (!end || !id || id > end) continue;
+            value = strtoul( id + 5, &stop, 10 );
+            /* the non-numeric Registration chunk is not a content chunk */
+            if (stop == id + 5 || *stop != '"') continue;
+            sel.chunkId = value;
+            TRACE( "chunk %u Ready\n", sel.chunkId );
+            count++;
+            more = callback( context, &sel, avail );
+        }
+        free( layout );
+        if (!count)
+        {
+            /* no layout with numeric chunks: the package is one launch chunk */
+            sel.chunkId = 1;
+            TRACE( "no layout; chunk 1 Ready\n" );
+            callback( context, &sel, avail );
+        }
+        break;
+    }
+    case XPackageChunkSelectorType_Language:
+    {
+        const char *xml = game_config(), *pos = xml;
+        char language[LOCALE_NAME_MAX_LENGTH];
+        BOOL more = TRUE;
+
+        while (more && pos && (pos = strstr( pos, "<Resource " )))
+        {
+            const char *end = strchr( pos, '>' ), *attr = strstr( pos, "Language=\"" );
+            SIZE_T len;
+
+            pos += 10;
+            if (!end || !attr || attr > end) continue;
+            attr += 10;
+            len = strcspn( attr, "\"" );
+            if (!len || len >= sizeof(language)) continue;
+            memcpy( language, attr, len );
+            language[len] = 0;
+            sel.language = language;
+            TRACE( "language %s Ready\n", debugstr_a( language ) );
+            more = callback( context, &sel, avail );
+        }
+        break;
+    }
+    default:
+        /* no tags or optional features are declared */
+        break;
+    }
     return S_OK;
 }
 
